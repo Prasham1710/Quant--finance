@@ -108,7 +108,8 @@ def normalize_bounds(bounds: Bounds, n_assets: int) -> list[tuple[float, float]]
     ``None`` means unbounded (short selling allowed) and is returned unchanged.
 
     Raises:
-        ValueError: if a pair has lo > hi or the bounds make sum(w) == 1 infeasible.
+        ValueError: if a bound is NaN, a pair has lo > hi, or the bounds make
+            sum(w) == 1 infeasible.
     """
     if bounds is None:
         return None
@@ -126,6 +127,8 @@ def normalize_bounds(bounds: Bounds, n_assets: int) -> list[tuple[float, float]]
     for lo, hi in pairs:
         lo = -np.inf if lo is None else float(lo)
         hi = np.inf if hi is None else float(hi)
+        if np.isnan(lo) or np.isnan(hi):
+            raise ValueError("bounds must not contain NaN (use None for no bound)")
         if lo > hi:
             raise ValueError(f"lower bound {lo} exceeds upper bound {hi}")
         out.append((lo, hi))
