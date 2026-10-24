@@ -390,16 +390,23 @@ def test_efficient_risk_unbounded_inverts_the_frontier(case):
         # Upper branch: r = B/A + sqrt(D (A σ² - 1)) / A.
         expected_r = b / a + math.sqrt(d * (a * target**2 - 1)) / a
         assert w @ mu == pytest.approx(expected_r, rel=1e-9)
-        np.testing.assert_allclose(
-            w,
-            efficient_return(mu, cov, expected_r, bounds=None),
-            atol=1e-8 * np.abs(w).max(),
-        )
-    np.testing.assert_allclose(
-        efficient_risk(mu, cov, sigma_mvp, bounds=None),
-        min_variance(cov, bounds=None),
-        atol=1e-7 * np.abs(min_variance(cov, bounds=None)).max(),
-    )
+        # Along the frontier w moves by (Δr / q) v, so for an ill-conditioned Σ a few
+        # ulps of difference in r move the weights visibly while the portfolios are
+        # the same: compare them in the Σ-norm (risk of the difference), which is
+        # well posed, and element-wise only when Σ is well conditioned.
+        diff = w - efficient_return(mu, cov, expected_r, bounds=None).to_numpy()
+        assert math.sqrt(max(diff @ cov @ diff, 0.0)) <= 1e-7 * target
+        if case == "well":
+            np.testing.assert_allclose(diff, 0.0, atol=1e-8 * np.abs(w).max())
+    # At σ_mvp the frontier is vertical (dr/dσ is infinite): an error δ in σ² (about
+    # cond(Σ)·eps relative, from computing σ_mvp) moves the portfolio by sqrt(δ) in
+    # the Σ-norm. So compare in that norm, with a tolerance of that size.
+    w_mvp = min_variance(cov, bounds=None).to_numpy()
+    diff = efficient_risk(mu, cov, sigma_mvp, bounds=None).to_numpy() - w_mvp
+    tol = max(1e-7, 3.0 * math.sqrt(np.linalg.cond(cov) * np.finfo(float).eps))
+    assert math.sqrt(max(diff @ cov @ diff, 0.0)) <= tol * sigma_mvp
+    if case == "well":
+        np.testing.assert_allclose(diff, 0.0, atol=1e-7 * np.abs(w_mvp).max())
 
 
 # ---------------------------------------------------------------------------
