@@ -109,13 +109,14 @@ $\hat\delta = \max(0, \min(1, \hat\kappa / T))$ with $\hat\kappa = (\hat\pi - \h
 
 Two targets are implemented:
 
-* **Constant correlation** (Ledoit & Wolf, 2003/2004, "Honey, I shrunk the sample
-  covariance matrix"). Each variance is kept, and every correlation is replaced by the
-  average correlation $\bar r$. This is the default because it suits assets with
-  heterogeneous volatilities.
+* **Constant correlation** (Ledoit & Wolf, 2004, "Honey, I shrunk the sample covariance
+  matrix", the `covCor.m` estimator). Each variance is kept, and every correlation is
+  replaced by the average correlation $\bar r$. This is the default because it suits
+  assets with heterogeneous volatilities.
 * **Scaled identity** (Ledoit & Wolf, 2004, "A well-conditioned estimator..."). The
-  target is $F = (\operatorname{tr} S / N) I$. It matches scikit-learn's `ledoit_wolf`
-  to $10^{-10}$.
+  target is $F = (\operatorname{tr} S / N) I$. For this target the estimator (like
+  scikit-learn's `ledoit_wolf`, which it matches to $10^{-10}$) drops the $\hat\rho$
+  term: $\hat\delta = \min(1, \hat\pi / (T\hat\gamma))$.
 
 More data means less noise, so $\hat\delta \to 0$ as $T$ grows.
 
@@ -141,8 +142,10 @@ portfolio optimal, and tilt them only where you have views.
 
 The backtest strategy uses an equal-weight prior, because market caps of a multi-asset
 ETF universe are not available. Its views are each asset's trailing 12-1 month momentum,
-held at 25% confidence. The result is a portfolio that tilts toward momentum while staying
-anchored to a diversified prior.
+held at 25% confidence. Idzorek's confidence is defined for each view on its own. With one
+absolute view on every asset, and correlated assets, the views interact. So the posterior
+can move more or less than 25% toward a given view, and max Sharpe on it can still be
+concentrated. Lowering the confidence keeps the weights closer to the prior.
 
 ### 5. Risk parity: equal risk contribution (Maillard, Roncalli & Teiletche, 2010)
 
@@ -199,16 +202,27 @@ The 9 strategies isolate one effect at a time:
 
 ## Results
 
-These results come from **known-truth Monte Carlo experiments**: returns are simulated
-from a synthetic 12-asset factor market whose true expected returns and covariance are
-known exactly. That is the only way to measure estimation error directly, because in
-real data the truth is never observed. They illustrate the method; they are not a
-claim about any real market. To reproduce them:
+These results come from **known-truth Monte Carlo experiments**. Returns are drawn
+i.i.d. multivariate normal, with the true mean and covariance of a synthetic factor market
+(12 assets, or 100 in Experiment 2). Because the truth is known exactly, estimation error
+can be measured directly; in real data the truth is never observed. The results
+illustrate the method; they are not a claim about any real market. Fat tails make
+estimation harder still: add `--tail-df 5` for Student-t draws. To reproduce them:
 
 ```bash
-python -m quantfin.portfolio experiment --source synthetic                # 12 assets, 200 trials
-python -m quantfin.portfolio experiment --source synthetic --n-assets 100 --trials 50
+# Experiment 1 (about 40 s)
+python -m quantfin.portfolio experiment --source synthetic
+
+# Experiment 2 alone (a few seconds)
+python -c "from quantfin.portfolio import data, experiments as e; \
+cov = data.synthetic_market(n_assets=100, n_years=16, seed=0).true_cov; \
+t = e.shrinkage_experiment(cov, n_trials=50, seed=0); \
+print(t[['n_obs', 'estimator', 'excess_volatility', 'shrinkage']].to_string())"
 ```
+
+`experiment --source synthetic --n-assets 100 --trials 50` also reproduces Experiment 2.
+It takes over 10 minutes, though, because it first runs the 100-asset version of
+Experiment 1.
 
 To run the same experiment calibrated to real ETF data (full-sample estimates are used
 as the truth), and the walk-forward backtest on real prices:
@@ -222,7 +236,9 @@ python -m quantfin.portfolio backtest
 
 200 simulated histories per sample size, long-only weights, rf = 0. The *believed*
 Sharpe ratio uses the estimated parameters the optimizer saw. The *true* Sharpe ratio
-scores the same weights with the true parameters.
+scores the same weights with the true parameters. In 0.5–4.5% of trials no estimated
+mean beat rf, so max Sharpe was undefined. Those trials use the min-variance portfolio
+instead, and the CLI reports this share as `fallback_rate`.
 
 | Days of data | Max Sharpe: believed | Max Sharpe: true | Max Sharpe (Ledoit-Wolf): true | Min variance: true | Equal weight: true | True optimum |
 |---|---|---|---|---|---|---|
@@ -242,12 +258,14 @@ What this shows:
 * **The "optimal" portfolio loses to naive 1/N** (0.54) at every sample size. This is the
   DeMiguel, Garlappi & Uppal (2009) result: the gain from optimizing is smaller than the
   loss from estimation error.
-* **Ledoit-Wolf does not fix max Sharpe.** Errors in the expected returns dominate here:
-  the standard error of a mean is about $\sigma/\sqrt{\text{years}}$, much larger than its
-  effect on the covariance. Chopra & Ziemba (1993) estimated that errors in the means
-  cost roughly 10 times as much as errors in the covariances. The remedies for the means
-  are different: ignore them (min variance, risk parity, HRP), or shrink them toward an
-  equilibrium prior (Black-Litterman).
+* **Ledoit-Wolf does not fix max Sharpe.** Errors in the expected returns dominate here.
+  With 12 assets, the covariance is estimated well from a few months of daily data. A
+  mean's standard error, $\sigma/\sqrt{\text{years}}$, stays large for decades.
+  Chopra & Ziemba (1993) found that, for typical risk tolerances, errors in the means cost
+  roughly 10 times as much as errors in the variances, and about 20 times as much as
+  errors in the covariances. The remedies for the means are different: ignore them (min
+  variance, risk parity, HRP), or shrink them toward an equilibrium prior
+  (Black-Litterman).
 
 The picture behind the numbers (Broadie, 1993):
 
@@ -322,7 +340,6 @@ Turnover and drawdowns are often more informative than CAGR.
 * Chopra, V. & Ziemba, W. (1993). The Effect of Errors in Means, Variances, and Covariances on Optimal Portfolio Choice. *Journal of Portfolio Management*.
 * He, G. & Litterman, R. (1999). The Intuition Behind Black-Litterman Model Portfolios. Goldman Sachs.
 * Jagannathan, R. & Ma, T. (2003). Risk Reduction in Large Portfolios: Why Imposing the Wrong Constraints Helps. *Journal of Finance*.
-* Ledoit, O. & Wolf, M. (2003). Improved estimation of the covariance matrix of stock returns with an application to portfolio selection. *Journal of Empirical Finance*.
 * Ledoit, O. & Wolf, M. (2004). Honey, I Shrunk the Sample Covariance Matrix. *Journal of Portfolio Management*.
 * Ledoit, O. & Wolf, M. (2004). A well-conditioned estimator for large-dimensional covariance matrices. *Journal of Multivariate Analysis*.
 * Idzorek, T. (2005). A Step-by-Step Guide to the Black-Litterman Model.
