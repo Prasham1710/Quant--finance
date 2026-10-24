@@ -57,6 +57,15 @@ _MAX_FILL_GAP = 5
 
 _INSTALL_HINT = 'pip install -e ".[data]"'
 
+# pandas < 3.1 parses CSV floats with a fast parser that can be off by an ulp, so
+# exact round trips need float_precision="round_trip"; pandas 3.1 made exact parsing
+# the default and deprecated the argument.
+_EXACT_FLOATS: dict[str, str] = (
+    {"float_precision": "round_trip"}
+    if tuple(int(part) for part in pd.__version__.split(".")[:2]) < (3, 1)
+    else {}
+)
+
 _UTC_OFFSET = re.compile(r"(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(?:Z|[+-]\d{2}:?\d{2})$")
 """A trailing UTC offset (``Z``, ``-05:00``, ``+0900``) after a clock time; group 1 = the time.
 
@@ -332,11 +341,12 @@ def load_prices_yahoo(
 def load_prices_csv(path: str | Path) -> pd.DataFrame:
     """Read a wide price CSV: first column dates, one column of prices per asset.
 
-    Missing cells are kept as NaN (see :func:`prices_to_returns` for alignment). Floats
-    are parsed with ``float_precision="round_trip"`` so a frame written by
-    ``DataFrame.to_csv`` reads back bit-for-bit. Dates written with a UTC offset (a
-    tz-aware frame, whose offset changes at DST switches) keep their local calendar
-    date and time; the offset is dropped, not converted to UTC.
+    Missing cells are kept as NaN (see :func:`prices_to_returns` for alignment).
+    Floats are parsed exactly (``float_precision="round_trip"`` before pandas 3.1,
+    the default since), so a frame written by ``DataFrame.to_csv`` reads back
+    bit-for-bit. Dates written with a UTC offset (a tz-aware frame, whose offset
+    changes at DST switches) keep their local calendar date and time; the offset is
+    dropped, not converted to UTC.
 
     Args:
         path: CSV file path.
@@ -352,7 +362,7 @@ def load_prices_csv(path: str | Path) -> pd.DataFrame:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"price file not found: {path}")
-    frame = pd.read_csv(path, index_col=0, float_precision="round_trip")
+    frame = pd.read_csv(path, index_col=0, **_EXACT_FLOATS)
     if frame.shape[1] == 0:
         raise ValueError(f"{path}: expected a date column followed by price columns")
     if frame.shape[0] == 0:

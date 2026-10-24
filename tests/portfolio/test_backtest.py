@@ -183,7 +183,7 @@ ROTATION = np.array(
 
 def rotating(window: pd.DataFrame) -> pd.Series:
     """Deterministic in the window: picks a row of ROTATION from its last date."""
-    return pd.Series(ROTATION[window.index[-1].dayofyear % 3], index=window.columns)
+    return pd.Series(ROTATION[window.index[-1].day_of_year % 3], index=window.columns)
 
 
 @pytest.mark.parametrize(("lookback", "rebalance_every", "cost_bps"), [(10, 3, 25.0), (40, 13, 7)])

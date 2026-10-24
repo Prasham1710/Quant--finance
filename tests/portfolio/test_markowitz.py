@@ -1071,7 +1071,8 @@ def test_singular_frontier_starts_at_best_minimum_variance_portfolio(seed, n, t,
     assert frontier["return"].iloc[0] >= best - 1e-9
     # A risk budget equal to the minimum volatility must reach the same return.
     noise = 1e-6 * math.sqrt(np.trace(cov) / n)
-    target = portfolio_volatility(min_variance(cov, bounds), cov)
+    # (The minimum can be exactly 0 with T < N; the budget must be positive.)
+    target = max(portfolio_volatility(min_variance(cov, bounds), cov), 1e-3 * noise)
     w = efficient_risk(mu, cov, target, bounds)
     assert portfolio_return(w, mu) >= best - 1e-9
     assert portfolio_volatility(w, cov) <= target * (1 + 1e-9) + noise
