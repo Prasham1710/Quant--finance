@@ -89,6 +89,13 @@ def mle_cov(values: np.ndarray) -> np.ndarray:
 
 
 def honey_reference(data: np.ndarray) -> tuple[np.ndarray, float]:
+    """Constant-correlation target and clipped intensity delta = max(0, min(1, kappa / T))."""
+    f, kappa, n_obs = honey_reference_kappa(data)
+    return f, max(0.0, min(1.0, kappa / n_obs))
+
+
+def honey_reference_kappa(data: np.ndarray) -> tuple[np.ndarray, float, int]:
+    """Constant-correlation target, UNCLIPPED kappa = (pi - rho) / gamma, and T."""
     rows = np.asarray(data, dtype=float).tolist()
     T, N = len(rows), len(rows[0])
     mean = [sum(rows[t][i] for t in range(T)) / T for i in range(N)]
@@ -120,8 +127,25 @@ def honey_reference(data: np.ndarray) -> tuple[np.ndarray, float]:
                     + math.sqrt(s[i][i] / s[j][j]) * theta_hat(j, i, j)
                 )
     gamma = sum((f[i][j] - s[i][j]) ** 2 for i in range(N) for j in range(N))
-    kappa = (pi - rho) / gamma
-    return np.array(f), max(0.0, min(1.0, kappa / T))
+    return np.array(f), (pi - rho) / gamma, T
+
+
+def common_factor_heavy_tail_returns(seed: int) -> np.ndarray:
+    """T <= N returns with a strong common factor and t(3) noise (3 <= T <= N < 40).
+
+    Strong correlation with heavy tails is the regime in which the finite-sample
+    rho-hat of the constant-correlation estimator can exceed pi-hat (kappa < 0).
+    """
+    rng = np.random.default_rng(seed)
+    n_assets = int(rng.integers(3, 40))
+    n_obs = int(rng.integers(3, n_assets + 1))
+    factor = rng.standard_normal((n_obs, 1)) * rng.uniform(0.5, 1.5, n_assets) * 3
+    noise = rng.standard_t(3, (n_obs, n_assets))
+    return (factor + noise) * rng.uniform(0.001, 0.05, n_assets)
+
+
+# Seeds of common_factor_heavy_tail_returns whose estimated kappa is negative.
+NEGATIVE_KAPPA_SEEDS = (313, 1672)
 
 
 def gaussian_population_kappa(cov: np.ndarray, target: str) -> float:
@@ -249,6 +273,79 @@ class TestMeanEwma:
     def test_invalid_span(self, span):
         with pytest.raises(ValueError, match="span"):
             mean_ewma(TINY, span=span)
+
+
+# ---------------------------------------------------------------------------
+# Row order for the order-dependent (exponentially weighted) estimators
+# ---------------------------------------------------------------------------
+
+
+def regime_switch_returns(index: pd.Index) -> pd.DataFrame:
+    """Old high-vol regime with positive drift, then a recent low-vol regime with negative drift."""
+    rng = np.random.default_rng(9)
+    n_old = len(index) * 2 // 3
+    n_new = len(index) - n_old
+    values = np.r_[
+        0.002 + 0.03 * rng.standard_normal(n_old), -0.003 + 0.005 * rng.standard_normal(n_new)
+    ]
+    return pd.DataFrame({"A": values, "B": 0.5 * values + 0.001}, index=index)
+
+
+EWMA_ESTIMATORS = [
+    pytest.param(lambda r: mean_ewma(r, span=5), id="mean_ewma"),
+    pytest.param(lambda r: cov_ewma(r, halflife=10), id="cov_ewma"),
+]
+DATE_INDEXES = [
+    pytest.param(pd.bdate_range("2020-01-01", periods=600), id="datetime"),
+    pytest.param(pd.period_range("2020-01-01", periods=600, freq="D"), id="period"),
+]
+
+
+class TestEwmaRowOrder:
+    @pytest.mark.parametrize("estimator", EWMA_ESTIMATORS)
+    @pytest.mark.parametrize("index", DATE_INDEXES)
+    def test_newest_first_dates_are_rejected(self, estimator, index):
+        # Vendor data often arrives newest-first. Weighting it as-is would give the oldest,
+        # high-vol regime the largest weight (an 8x wrong daily vol) without any error.
+        ascending = regime_switch_returns(index)
+        with pytest.raises(ValueError, match="ascending date order"):
+            estimator(ascending.iloc[::-1])
+        shuffled = ascending.sample(frac=1.0, random_state=0)
+        with pytest.raises(ValueError, match="ascending date order"):
+            estimator(shuffled)
+
+    @pytest.mark.parametrize("estimator", EWMA_ESTIMATORS)
+    @pytest.mark.parametrize("index", DATE_INDEXES)
+    def test_sorting_restores_the_ascending_estimate(self, estimator, index):
+        ascending = regime_switch_returns(index)
+        expected = estimator(ascending)
+        restored = estimator(ascending.iloc[::-1].sort_index())
+        if isinstance(expected, pd.DataFrame):
+            pd.testing.assert_frame_equal(restored, expected, rtol=1e-14)
+        else:
+            pd.testing.assert_series_equal(restored, expected, rtol=1e-14)
+        # The date index only labels rows; the estimate equals the positional numpy one.
+        np.testing.assert_allclose(
+            np.asarray(estimator(ascending.to_numpy())), np.asarray(expected), rtol=1e-14
+        )
+
+    def test_ascending_dates_see_the_recent_regime(self):
+        data = regime_switch_returns(pd.bdate_range("2020-01-01", periods=600))
+        daily_vol = math.sqrt(cov_ewma(data, halflife=10).loc["A", "A"] / 252)
+        assert 0.003 < daily_vol < 0.008
+        assert mean_ewma(data, span=5)["A"] < 0
+
+    @pytest.mark.parametrize("estimator", EWMA_ESTIMATORS)
+    def test_non_date_index_is_taken_positionally(self, estimator):
+        # Integer labels carry no time information, so rows are used in the given order
+        # (last row = newest), exactly as for numpy input.
+        reversed_rows = regime_switch_returns(pd.RangeIndex(600)).iloc[::-1]
+        assert not reversed_rows.index.is_monotonic_increasing
+        np.testing.assert_allclose(
+            np.asarray(estimator(reversed_rows)),
+            np.asarray(estimator(reversed_rows.to_numpy())),
+            rtol=1e-14,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +487,18 @@ class TestLedoitWolfIdentity:
         _, _, delta = ledoit_wolf_shrinkage(0.01 * rng.standard_normal((500, 8)), "identity")
         assert delta == 1.0
 
+    def test_two_observations_give_zero_intensity(self):
+        # Demeaned rows satisfy x_2 = -x_1, so x_t x_t' = S for both t and b_bar^2 = 0:
+        # nothing is shrunk and the rank-1 sample covariance comes back unchanged.
+        data = random_returns(2, 5, seed=30)
+        shrunk, _, delta = ledoit_wolf_shrinkage(data, target="identity")
+        sk_cov, sk_delta = sk_ledoit_wolf(data)
+        assert delta == pytest.approx(0.0, abs=1e-12)
+        assert sk_delta == pytest.approx(0.0, abs=1e-12)
+        np.testing.assert_allclose(shrunk, mle_cov(data), rtol=1e-10, atol=1e-16)
+        np.testing.assert_allclose(shrunk, sk_cov, rtol=1e-10, atol=1e-16)
+        assert not is_positive_definite(shrunk)
+
 
 # ---------------------------------------------------------------------------
 # Ledoit-Wolf, constant-correlation target (covCor.m)
@@ -454,6 +563,7 @@ class TestLedoitWolfConstantCorrelation:
         assert mean_deltas[-1] < 0.005
 
     def test_positive_definite_when_fewer_observations_than_assets(self):
+        # Shrinkage repairs a singular S only when delta > 0 (see the negative-kappa test).
         data = random_returns(12, 30, seed=16)
         shrunk, target, delta = ledoit_wolf_shrinkage(data)
         sample = mle_cov(data)
@@ -463,6 +573,69 @@ class TestLedoitWolfConstantCorrelation:
         assert is_positive_definite(target)
         assert is_positive_definite(shrunk)
         assert np.linalg.eigvalsh(shrunk).min() > 0
+
+    def test_positive_definite_whenever_intensity_is_positive_with_t_le_n(self):
+        # Weyl: lambda_min(delta F + (1 - delta) S) >= delta lambda_min(F) because S is PSD,
+        # so the result is PD exactly when delta > 0 (F is PD). delta = 0 returns S itself.
+        positive, zero = 0, 0
+        for seed in [*range(200), *NEGATIVE_KAPPA_SEEDS]:
+            data = common_factor_heavy_tail_returns(seed)
+            shrunk, target, delta = ledoit_wolf_shrinkage(data)
+            assert is_positive_definite(target)
+            if delta > 0:
+                positive += 1
+                eig_min = np.linalg.eigvalsh(shrunk).min()
+                floor = delta * np.linalg.eigvalsh(target).min()
+                assert eig_min >= floor - 1e-12 * np.abs(shrunk).max()
+                assert is_positive_definite(shrunk)
+            else:
+                zero += 1
+                np.testing.assert_allclose(shrunk, mle_cov(data), rtol=1e-10, atol=1e-18)
+                assert not is_positive_definite(shrunk)
+        assert positive >= 190 and zero >= len(NEGATIVE_KAPPA_SEEDS)
+
+    @pytest.mark.parametrize("seed", NEGATIVE_KAPPA_SEEDS)
+    def test_negative_kappa_gives_zero_intensity_and_singular_result_when_t_le_n(self, seed):
+        # Documented edge case of the faithful covCor.m transcription: the finite-sample
+        # rho-hat exceeds pi-hat, kappa < 0 and delta is clipped to 0, so with T <= N the
+        # "shrunk" matrix is the singular sample covariance. Callers must check PD.
+        data = common_factor_heavy_tail_returns(seed)
+        n_obs, n_assets = data.shape
+        assert n_obs <= n_assets
+        _, ref_kappa, _ = honey_reference_kappa(data)
+        assert ref_kappa < 0
+        shrunk, target, delta = ledoit_wolf_shrinkage(data)
+        assert delta == 0.0
+        np.testing.assert_allclose(shrunk, mle_cov(data), rtol=1e-10, atol=1e-18)
+        assert is_positive_definite(target)  # the target itself is fine; it just gets no weight
+        cov = cov_ledoit_wolf(data)
+        assert not is_positive_definite(cov)
+        assert np.linalg.matrix_rank(cov.to_numpy()) <= n_obs - 1
+
+    def test_correct_target_is_shrunk_toward_heavily(self):
+        # Constant-correlation analogue of the spherical identity test. The truth HAS constant
+        # correlation (0.4) with unequal vols, so F is unbiased and far less noisy than S, and
+        # delta should be near 1. ||S - F||^2 is then only ~1e-4 of ||S||^2. That is exactly
+        # where an over-eager "S already equals F" tolerance would wrongly force delta = 0.
+        n_assets = 8
+        vol = np.linspace(0.005, 0.03, n_assets)
+        corr = np.full((n_assets, n_assets), 0.4)
+        np.fill_diagonal(corr, 1.0)
+        truth = corr * np.outer(vol, vol)
+        deltas, gap_ratios, err_shrunk, err_sample = [], [], [], []
+        for seed in range(10):
+            data = gaussian_returns(5000, cov=truth, seed=300 + seed).to_numpy()
+            shrunk, target, delta = ledoit_wolf_shrinkage(data)
+            sample = mle_cov(data)
+            deltas.append(delta)
+            gap_ratios.append(np.sum((sample - target) ** 2) / np.sum(sample**2))
+            err_shrunk.append(np.sum((shrunk - truth) ** 2))
+            err_sample.append(np.sum((sample - truth) ** 2))
+        assert max(gap_ratios) < 1e-3  # the regime the test is about
+        assert np.mean(deltas) > 0.9
+        # F keeps the noisy sample variances, so only the off-diagonal error is removed;
+        # across seed sets the total Frobenius error drops to ~0.65 of the sample's.
+        assert np.mean(err_shrunk) < 0.8 * np.mean(err_sample)
 
     def test_target_has_unit_diagonal_and_constant_average_correlation(self):
         data = gaussian_returns(300, seed=17).to_numpy()
@@ -612,6 +785,21 @@ class TestCovToCorr:
             cov_to_corr(np.array([[1.0, 0.5], [0.1, 1.0]]))
         with pytest.raises(ValueError, match="square"):
             cov_to_corr(np.ones((2, 3)))
+
+    @pytest.mark.parametrize("sign", [1.0, -1.0])
+    def test_correlation_tolerance_covers_rounding_only(self, sign):
+        vols = np.array([0.2, 0.3])
+
+        def cov_with_corr(rho: float) -> np.ndarray:
+            return np.array([[1.0, rho], [rho, 1.0]]) * np.outer(vols, vols)
+
+        # A correlation 1e-6 beyond +-1 is a broken matrix, not rounding.
+        with pytest.raises(ValueError, match="correlation"):
+            cov_to_corr(cov_with_corr(sign * (1.0 + 1e-6)))
+        # 1e-12 beyond +-1 is rounding dust: accepted and clipped onto the boundary.
+        corr, out_vols = cov_to_corr(cov_with_corr(sign * (1.0 + 1e-12)))
+        np.testing.assert_array_equal(corr.to_numpy(), [[1.0, sign], [sign, 1.0]])
+        np.testing.assert_allclose(out_vols.to_numpy(), vols, rtol=1e-14)
 
 
 # ---------------------------------------------------------------------------

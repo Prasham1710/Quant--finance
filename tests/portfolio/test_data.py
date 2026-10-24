@@ -14,6 +14,7 @@ import math
 import re
 import sys
 import types
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -121,6 +122,72 @@ def test_unsorted_input_is_sorted_by_date():
     pd.testing.assert_frame_equal(
         prices_to_returns(shuffled), prices_to_returns(prices), check_freq=False
     )
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        ["2020-1-9", "2020-1-10", "2020-1-13"],  # non-ISO: "2020-1-10" < "2020-1-9" as text
+        ["1/9/2020", "1/10/2020", "1/13/2020"],  # US style
+        ["2020-01-09", "2020-01-10", "2020-01-13"],  # ISO strings
+    ],
+)
+def test_string_dates_are_sorted_chronologically_not_alphabetically(labels):
+    # Exactly what pd.read_csv(path, index_col=0) without parse_dates hands over.
+    prices = pd.DataFrame({"A": [100.0, 110.0, 121.0]}, index=pd.Index(labels, name="Date"))
+    expected_index = pd.DatetimeIndex(["2020-01-10", "2020-01-13"], name="Date")
+    for frame in (prices, prices.iloc[::-1]):
+        out = prices_to_returns(frame)
+        assert list(out.index) == list(expected_index)
+        assert out.index.name == "Date"
+        np.testing.assert_allclose(out["A"].to_numpy(), [0.10, 0.10], rtol=1e-14)
+
+
+def test_numeric_period_index_is_sorted_numerically():
+    # A numeric (e.g. simulated, RangeIndex-like) index stays numeric: 2 < 10 numerically.
+    prices = pd.DataFrame({"A": [121.0, 100.0, 110.0]}, index=[10, 1, 2])
+    out = prices_to_returns(prices)
+    assert list(out.index) == [2, 10]
+    np.testing.assert_allclose(out["A"].to_numpy(), [0.10, 0.10], rtol=1e-14)
+
+
+@pytest.mark.parametrize(
+    ("labels", "match"),
+    [
+        (["a", "b", "c"], "dates"),
+        (["2020-01-09", "soon", "2020-01-13"], "dates"),
+        (["2020-01-09", "2020-1-9", "2020-01-13"], "duplicate"),  # same day, two spellings
+    ],
+)
+def test_unparseable_or_duplicate_string_dates_raise(labels, match):
+    prices = pd.DataFrame({"A": [100.0, 110.0, 121.0]}, index=labels)
+    with pytest.raises(ValueError, match=match):
+        prices_to_returns(prices)
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        # pd.to_datetime(..., errors="coerce") on a messy date column: the usual source
+        pd.to_datetime(["2020-01-02", "bad-date", "2020-01-06", "2020-01-03"], errors="coerce"),
+        pd.DatetimeIndex(["2020-01-02", None, None, "2020-01-03"]),  # two NaT: not "duplicate"
+        pd.PeriodIndex(["2020-01-02", None, "2020-01-06", "2020-01-03"], freq="D"),
+        pd.TimedeltaIndex(["1D", None, "3D", "2D"]),
+        pd.Index([1.0, np.nan, 3.0, 2.0]),
+        pd.Index([1, None, 3, 2], dtype="Int64"),
+        # text labels that parse to NaT (the text path)
+        pd.Index(["2020-01-02", "NaT", "2020-01-06", "2020-01-03"]),
+        pd.Index(["2020-01-02", "nan", "2020-01-06", "2020-01-03"]),
+        pd.Index(["2020-01-02", "", "2020-01-06", "2020-01-03"]),
+    ],
+    ids=["coerced", "two-nat", "period", "timedelta", "float", "Int64", "NaT", "nan", "empty"],
+)
+def test_missing_index_labels_raise_on_every_index_type(index):
+    # A NaT/NaN label sorts last and would be paired with the last real date: a
+    # fabricated return (here 105/121 - 1) at an unknown date.
+    prices = pd.DataFrame({"A": [100.0, 105.0, 121.0, 110.0]}, index=index)
+    with pytest.raises(ValueError, match="missing"):
+        prices_to_returns(prices)
 
 
 def test_common_start_drops_rows_before_every_asset_trades():
@@ -276,6 +343,41 @@ def test_csv_validation(tmp_path: Path, content: str, match: str):
         load_prices_csv(path)
 
 
+@pytest.mark.parametrize("tz", ["America/New_York", "Europe/London", "Asia/Tokyo", "UTC"])
+def test_csv_tz_aware_dates_across_dst_keep_local_calendar_date(tmp_path: Path, tz: str):
+    # DataFrame.to_csv writes the UTC offset of each row, and it changes at DST
+    # (-05:00 -> -04:00 in New York on 2021-03-14, +00:00 -> +01:00 in London on
+    # 2021-03-28). The exchange-local calendar date must be kept; converting to UTC
+    # would shift every Tokyo date back by one day.
+    idx = pd.bdate_range("2021-03-10", periods=20, tz=tz, name="Date")
+    frame = pd.DataFrame({"SPY": np.arange(1.0, 21.0), "TLT": np.arange(21.0, 41.0)}, idx)
+    path = tmp_path / "tz.csv"
+    frame.to_csv(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # pandas 2 emits a mixed-offset FutureWarning
+        out = load_prices_csv(path)
+    assert out.index.tz is None and out.index.name == "Date"
+    assert list(out.index) == list(pd.bdate_range("2021-03-10", periods=20))
+    np.testing.assert_array_equal(out.to_numpy(), frame.to_numpy())
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("date,A\n2021-03-12T09:30:00Z,1\n2021-03-15T09:30:00Z,2\n", ["2021-03-12 09:30"]),
+        ("date,A\n2021-03-12 16:00-0500,1\n2021-03-15 16:00-0400,2\n", ["2021-03-12 16:00"]),
+        ("date,A\n01-02-2020,1\n01-03-2020,2\n", ["2020-01-02", "2020-01-03"]),  # no offset
+    ],
+)
+def test_csv_offset_stripping_only_touches_utc_offsets(tmp_path: Path, content, expected):
+    path = tmp_path / "p.csv"
+    path.write_text(content)
+    out = load_prices_csv(path)
+    assert out.index.tz is None
+    assert len(out) == 2
+    assert list(out.index[: len(expected)]) == list(pd.to_datetime(expected))
+
+
 def test_csv_missing_file(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         load_prices_csv(tmp_path / "nope.csv")
@@ -296,9 +398,13 @@ def _close_values(ticker: str, n: int) -> np.ndarray:
 def _yahoo_frame(
     tickers: list[str], n: int = 8, layout: str = "column", tz: str | None = None
 ) -> pd.DataFrame:
-    """Mimic yfinance.download output (tickers come back alphabetically sorted)."""
+    """Mimic yfinance.download output.
+
+    Like the real one (``yfinance.multi.download``: ``set(t.upper() for t in tickers)``),
+    symbols come back upper-cased, de-duplicated and alphabetically sorted.
+    """
     idx = pd.bdate_range("2021-03-01", periods=n, tz=tz, name="Date")
-    order = sorted(tickers)
+    order = sorted({t.upper() for t in tickers})
     data = {}
     for t in order:
         close = _close_values(t, n)
@@ -525,19 +631,125 @@ def test_yahoo_missing_dependency_gives_install_hint(
         load_prices_yahoo(["SPY"], cache_dir=tmp_path)
 
 
-@pytest.mark.parametrize("tickers", [[], ["SPY", "SPY"], ["SPY", ""], ["SPY", 3]])
+@pytest.mark.parametrize(
+    "tickers",
+    [[], ["SPY", "SPY"], ["SPY", ""], ["SPY", " "], ["SPY", 3], ["SPY", "spy"], ["SPY", " SPY"]],
+)
 def test_yahoo_ticker_validation(install_yf, tickers):
+    # Yahoo symbols are case-insensitive, so "spy" duplicates "SPY" (yfinance would
+    # silently merge them into one column).
     fake = install_yf()
     with pytest.raises(ValueError, match="tickers"):
         load_prices_yahoo(tickers, cache_dir=None)
     assert fake.calls == []
 
 
+def test_yahoo_symbols_are_case_insensitive_like_yfinance(install_yf, tmp_path: Path):
+    # Real yfinance upper-cases every symbol, so its columns are ("Close", "SPY") even
+    # when asked for "spy"; the loader must request and label the canonical symbols.
+    fake = install_yf()
+    out = load_prices_yahoo(["spy", " Tlt "], start="2021-01-01", cache_dir=tmp_path)
+    assert fake.calls[0][0] == ["SPY", "TLT"]
+    assert list(out.columns) == ["SPY", "TLT"]
+    np.testing.assert_array_equal(out["SPY"].to_numpy(), _close_values("SPY", 8))
+    np.testing.assert_array_equal(out["TLT"].to_numpy(), _close_values("TLT", 8))
+    # Another spelling of the same request is the same cache entry.
+    again = load_prices_yahoo(["SPY", "tlt"], start="2021-01-01", cache_dir=tmp_path)
+    assert len(fake.calls) == 1
+    assert len(list(tmp_path.iterdir())) == 1
+    pd.testing.assert_frame_equal(out, again, check_exact=True, check_freq=False)
+    # Single lower-case ticker through the flat (pre-0.2.48) layout as well.
+    install_yf(lambda tickers, **kw: _yahoo_frame(tickers, layout="flat"))
+    single = load_prices_yahoo("gld", cache_dir=None)
+    assert list(single.columns) == ["GLD"]
+    np.testing.assert_array_equal(single["GLD"].to_numpy(), _close_values("GLD", 8))
+
+
+def test_yahoo_cache_write_is_atomic(install_yf, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A crash half-way through writing the cache must not leave a truncated file that
+    # a later call would silently serve as if it were the full history.
+    fake = install_yf()
+    real_to_csv = pd.DataFrame.to_csv
+
+    def crash_mid_write(self, path_or_buf=None, *args, **kwargs):
+        text = real_to_csv(self, None, *args, **kwargs)
+        half = text[: len(text) // 2]
+        if hasattr(path_or_buf, "write"):
+            path_or_buf.write(half)
+        else:
+            Path(path_or_buf).write_text(half)
+        raise OSError("simulated crash mid-write")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", crash_mid_write)
+    with pytest.raises(OSError, match="simulated crash"):
+        load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == []  # neither a partial cache nor a temp file
+    monkeypatch.setattr(pd.DataFrame, "to_csv", real_to_csv)
+    out = load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert len(fake.calls) == 2 and len(out) == 8
+    np.testing.assert_array_equal(out["TLT"].to_numpy(), _close_values("TLT", 8))
+    assert [p.suffix for p in tmp_path.iterdir()] == [".csv"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",  # zero bytes (e.g. a crash before anything was flushed)
+        "\x00\x00\x00garbage",
+        "Date,SPY,TLT\n",  # header only
+        "Date,SPY,TLT\n2021-03-01,1.0,2.0\n2021-03-01,1.5,2.0\n",  # duplicate date
+        "Date,SPY,TLT\nnot-a-date,1.0,2.0\n",
+        "Date,SPY,TLT\n2021-03-01,1.0,\n2021-03-02,1.1,\n",  # a ticker with no prices
+        'Date,SPY,TLT\n2021-03-01,1.0,"unterminated\n',
+    ],
+)
+def test_yahoo_unreadable_cache_is_replaced(install_yf, tmp_path: Path, content: str):
+    fake = install_yf()
+    fresh = load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    (path,) = tmp_path.glob("*.csv")
+    path.write_text(content)
+    out = load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert len(fake.calls) == 2  # re-downloaded instead of raising or returning junk
+    pd.testing.assert_frame_equal(out, fresh, check_exact=True, check_freq=False)
+    # ... and the bad file was overwritten, so the next call is a cache hit again.
+    again = load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert len(fake.calls) == 2
+    pd.testing.assert_frame_equal(again, fresh, check_exact=True, check_freq=False)
+
+
+def test_yahoo_identical_repeated_rows_are_collapsed(install_yf, tmp_path: Path):
+    def responder(tickers, **kw):
+        frame = _yahoo_frame(tickers)
+        return pd.concat([frame, frame.iloc[[3]]]).sort_index()  # day 3 sent twice
+
+    fake = install_yf(responder)
+    out = load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert len(out) == 8 and out.index.is_unique
+    np.testing.assert_array_equal(out["SPY"].to_numpy(), _close_values("SPY", 8))
+    # the cached copy is readable and identical (it used to fail forever on reread)
+    cached = load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert len(fake.calls) == 1
+    pd.testing.assert_frame_equal(out, cached, check_exact=True, check_freq=False)
+
+
+def test_yahoo_conflicting_prices_for_one_date_raise_and_are_not_cached(install_yf, tmp_path: Path):
+    def responder(tickers, **kw):
+        frame = _yahoo_frame(tickers)
+        extra = frame.iloc[[3]].copy()
+        extra[("Close", "SPY")] += 1.0
+        return pd.concat([frame, extra]).sort_index()
+
+    install_yf(responder)
+    with pytest.raises(RuntimeError, match=r"conflicting prices.*2021-03-04"):
+        load_prices_yahoo(["SPY", "TLT"], start="2021-01-01", cache_dir=tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
 # --------------------------------------------------------------------------------------
 # synthetic_market
 # --------------------------------------------------------------------------------------
 
-LONG_YEARS = 200  # 50,400 daily rows (stays inside the datetime64[ns] range on pandas 2)
+LONG_YEARS = 200  # 50,400 daily rows (synthetic dates must end by 2262-04-11, ~257 years)
 
 
 @pytest.fixture(scope="module")
@@ -645,6 +857,52 @@ def test_sample_mean_converges_to_true_mu(fixture_name: str, request: pytest.Fix
     assert np.abs(z).max() < 4.5
 
 
+def test_synthetic_drift_is_exact_simple_return_mean(monkeypatch: pytest.MonkeyPatch):
+    # Noise-free check of the drift convention, which the sampling test above cannot
+    # resolve: with every shock zero, each daily SIMPLE return must be exactly
+    # true_mu / 252 (no Ito term -sigma^2/2, no geometric (1 + mu)^(1/252) - 1), and the
+    # prices must compound it: P_t = 100 (1 + true_mu / 252)^t.
+    reference = synthetic_market(seed=6, n_years=3)
+    monkeypatch.setattr(
+        "quantfin.portfolio.data._unit_variance_shocks",
+        lambda rng, size, tail_df: np.zeros(size),
+    )
+    for tail_df in (5.0, None):
+        m = synthetic_market(seed=6, n_years=3, tail_df=tail_df)
+        # the truth is drawn before any shock, so it is unaffected by the patch
+        pd.testing.assert_series_equal(m.true_mu, reference.true_mu, check_exact=True)
+        daily = m.true_mu.to_numpy() / TRADING_DAYS
+        np.testing.assert_allclose(m.returns.to_numpy(), np.tile(daily, (756, 1)), rtol=1e-15)
+        t = np.arange(757)[:, None]
+        np.testing.assert_allclose(m.prices.to_numpy(), 100.0 * (1.0 + daily) ** t, rtol=1e-12)
+
+
+def test_synthetic_moments_exact_for_orthogonal_shocks(monkeypatch: pytest.MonkeyPatch):
+    # Feed shocks whose columns are orthogonal, zero-mean +-1 vectors (Hadamard columns,
+    # dropping the all-ones one), so their sample moments are EXACTLY mean 0 and
+    # covariance I. Since r_t = m + B f_t + e_t is linear in the shocks, the sample mean
+    # and (population, ddof=0) covariance of the returns must then equal true_mu / 252
+    # and true_cov / 252 to rounding: an exact check of the drift, the loadings
+    # (B vs B'), the factor/idiosyncratic scales and the sqrt(252) de-annualization.
+    from scipy.linalg import hadamard
+
+    n_obs, n_assets, n_factors = 64, 6, 3
+    columns = iter(hadamard(n_obs)[:, 1:].T.astype(float))
+
+    def orthogonal_shocks(rng, size, tail_df):
+        return np.column_stack([next(columns) for _ in range(size[1])])
+
+    monkeypatch.setattr("quantfin.portfolio.data._unit_variance_shocks", orthogonal_shocks)
+    m = synthetic_market(
+        n_assets=n_assets, n_factors=n_factors, n_years=n_obs / TRADING_DAYS, seed=8
+    )
+    r = m.returns.to_numpy()
+    assert r.shape == (n_obs, n_assets)
+    np.testing.assert_allclose(r.mean(axis=0), m.true_mu.to_numpy() / TRADING_DAYS, rtol=1e-12)
+    sample = np.cov(r, rowvar=False, ddof=0)
+    np.testing.assert_allclose(sample, m.true_cov.to_numpy() / TRADING_DAYS, rtol=1e-12, atol=0)
+
+
 def test_sample_cov_converges_gaussian_z_scores(long_gauss_market: SyntheticMarket):
     # Gaussian: Var(S_ij) ~= (Sigma_ij^2 + Sigma_ii Sigma_jj) / n (Anderson, 2003, Thm 3.4.4).
     m = long_gauss_market
@@ -704,10 +962,37 @@ def test_synthetic_small_and_large_universes():
     assert list(many.returns.columns)[-1] == "A12"
 
 
-def test_extreme_tails_that_would_bankrupt_an_asset_raise():
-    # tail_df just above 2 has enormous shocks; seed 1 produces a daily return <= -100%.
+@pytest.mark.parametrize(
+    ("seed", "tail_df"),
+    [
+        (1, 2.05),  # tail_df just above 2: enormous shocks
+        # tail_df = 3, a common calibration for daily equity returns, is not immune:
+        # about 1% of seeds raise at the default 15-year, 10-asset size (documented).
+        (167, 3.0),
+    ],
+)
+def test_heavy_tails_that_would_bankrupt_an_asset_raise(seed: int, tail_df: float):
     with pytest.raises(ValueError, match="-100%"):
-        synthetic_market(seed=1, tail_df=2.05, n_years=15)
+        synthetic_market(seed=seed, tail_df=tail_df, n_years=15)
+    # The advice in the message works: lighter tails, same seed (and the same truth).
+    synthetic_market(seed=seed, tail_df=5.0, n_years=15)
+
+
+def test_synthetic_dates_limited_to_nanosecond_range_on_every_pandas():
+    # pandas 2 cannot index dates past 2262-04-11 at ns resolution (OutOfBoundsDatetime
+    # with an internal message) while pandas 3 can; the limit is enforced up front so
+    # the behaviour and the error are the same on both.
+    last_ok = np.busday_offset(np.datetime64("2262-04-11"), 0, roll="backward")
+    start = str(np.busday_offset(last_ok, -9))  # 10 return dates ending on last_ok
+    fits = synthetic_market(n_assets=2, n_years=10 / TRADING_DAYS, start=start)
+    assert fits.returns.index[-1] == pd.Timestamp(str(last_ok))
+    for kwargs in (
+        {"n_years": 11 / TRADING_DAYS, "start": start},  # one business day too many
+        {"n_years": 300},  # from the default 2005 start
+        {"n_years": 1, "start": "1677-09-22"},  # its price row would precede 1677-09-22
+    ):
+        with pytest.raises(ValueError, match="simulate_returns"):
+            synthetic_market(n_assets=2, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -810,6 +1095,24 @@ def test_simulate_singular_cov_perfectly_correlated_assets():
     dev = out - np.array([0.05, 0.10]) / TRADING_DAYS
     np.testing.assert_allclose(dev[1].to_numpy(), 2 * dev[0].to_numpy(), rtol=1e-9, atol=1e-15)
     assert dev[0].std() == pytest.approx(vol / math.sqrt(TRADING_DAYS), rel=0.1)
+
+
+@pytest.mark.parametrize("scale", [1e-12, 1e-8, 1e-4, 1.0, 1e4])
+def test_simulate_psd_check_is_scale_invariant(scale: float):
+    # Being positive semi-definite does not depend on units, so neither may the check:
+    # a "correlation" of 2 (eigenvalues 3s, -s), or of 1 + 1e-6, is invalid at any scale,
+    # while a singular rank-1 matrix (asset 2 = 2 x asset 1) is valid at any scale.
+    rng = np.random.default_rng(0)
+    for rho in (2.0, 1.0 + 1e-6):
+        indefinite = scale * np.array([[1.0, rho], [rho, 1.0]])
+        with pytest.raises(ValueError, match="semi-definite"):
+            simulate_returns(np.zeros(2), indefinite, 10, rng)
+    singular = scale * np.array([[1.0, 2.0], [2.0, 4.0]])
+    out = simulate_returns(np.zeros(2), singular, 50, rng).to_numpy()
+    # Cholesky may "succeed" on the rounded matrix with a pivot ~ sqrt(eps) * scale,
+    # hence a relative (not exact) tolerance on the linear relation.
+    residual = np.abs(out[:, 1] - 2.0 * out[:, 0]).max()
+    assert residual <= 1e-6 * np.abs(out[:, 0]).max()
 
 
 @pytest.mark.parametrize("tail_df", [None, 6.0])

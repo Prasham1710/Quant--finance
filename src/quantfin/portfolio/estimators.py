@@ -64,6 +64,19 @@ def _returns_for_cov(returns: pd.DataFrame | np.ndarray) -> pd.DataFrame:
     return frame
 
 
+def _require_ascending_dates(frame: pd.DataFrame) -> None:
+    # EWMA weights are assigned by row position (last row = newest). Vendor data often
+    # arrives newest-first, and weighting it as-is would give the OLDEST observations
+    # the largest weight without any visible error. A date-like index lets us detect
+    # that; any other index (e.g. numpy input) is taken to be in chronological order.
+    index = frame.index
+    if isinstance(index, (pd.DatetimeIndex, pd.PeriodIndex)) and not index.is_monotonic_increasing:
+        raise ValueError(
+            "returns must be in ascending date order (oldest row first) for exponentially "
+            "weighted estimates; sort them first, e.g. returns.sort_index()"
+        )
+
+
 def _symmetrize(matrix: np.ndarray) -> np.ndarray:
     return 0.5 * (matrix + matrix.T)
 
@@ -141,8 +154,12 @@ def mean_ewma(
     i.e. the last value of ``pandas.DataFrame.ewm(span=span, adjust=True).mean()``.
     ``span = 1`` puts all weight on the last observation.
 
+    The weights depend on row order: the last row is taken as the newest. A
+    ``DatetimeIndex`` or ``PeriodIndex`` that is not ascending (e.g.
+    newest-first vendor data) is rejected rather than silently mis-weighted.
+
     Args:
-        returns: T x N simple returns.
+        returns: T x N simple returns, oldest row first.
         span: decay span in periods (>= 1); the centre of mass is (span - 1) / 2.
         periods_per_year: periods per year used to annualize.
 
@@ -150,9 +167,11 @@ def mean_ewma(
         Series of annualized expected returns indexed by asset.
 
     Raises:
-        ValueError: on invalid returns, ``span < 1`` or non-positive ``periods_per_year``.
+        ValueError: on invalid returns, a date index not in ascending order,
+            ``span < 1`` or non-positive ``periods_per_year``.
     """
     frame = as_returns_frame(returns)
+    _require_ascending_dates(frame)
     ppy = _check_periods_per_year(periods_per_year)
     span_f = float(span)
     if not np.isfinite(span_f) or span_f < 1.0:
@@ -214,8 +233,12 @@ def cov_ewma(
     The result is symmetric positive semi-definite (a positive combination of
     outer products).
 
+    The weights depend on row order: the last row is taken as the newest. A
+    ``DatetimeIndex`` or ``PeriodIndex`` that is not ascending (e.g.
+    newest-first vendor data) is rejected rather than silently mis-weighted.
+
     Args:
-        returns: T x N simple returns (T >= 2).
+        returns: T x N simple returns (T >= 2), oldest row first.
         halflife: decay half-life in periods (> 0).
         periods_per_year: periods per year used to annualize.
 
@@ -223,11 +246,13 @@ def cov_ewma(
         N x N symmetric PSD covariance DataFrame labelled by asset.
 
     Raises:
-        ValueError: on invalid returns, T < 2, non-positive ``halflife`` or
-            ``periods_per_year``, or a half-life so short that all weight sits on
-            a single observation (the covariance is then not identifiable).
+        ValueError: on invalid returns, T < 2, a date index not in ascending
+            order, non-positive ``halflife`` or ``periods_per_year``, or a
+            half-life so short that all weight sits on a single observation (the
+            covariance is then not identifiable).
     """
     frame = _returns_for_cov(returns)
+    _require_ascending_dates(frame)
     ppy = _check_periods_per_year(periods_per_year)
     halflife_f = float(halflife)
     if not np.isfinite(halflife_f) or halflife_f <= 0:
@@ -361,6 +386,18 @@ def ledoit_wolf_shrinkage(
     If S already equals F (||S - F||_F^2 <= 1e-20 ||S||_F^2, e.g. any 2-asset
     problem with the constant-correlation target), delta is 0.
 
+    delta = 0 can also happen in finite samples, and then Sigma_hat = S exactly.
+    For the constant-correlation target the estimated kappa can be <= 0: with
+    highly correlated, heavy-tailed returns the estimated rho can exceed pi.
+    The intensity is then clipped to 0, as in covCor.m. When T <= N, S has rank
+    at most T - 1, so the "shrunk" matrix is then SINGULAR. Shrinkage guarantees
+    positive definiteness only when delta > 0 and F is positive definite.
+    Callers that need an invertible matrix, typically because T is small, must
+    check the result, e.g. with :func:`is_positive_definite`. The identity
+    target is affected only in degenerate cases. Its b_bar^2 is a sum of
+    squares and vanishes only when every x_t x_t' equals S, which is always
+    true for T = 2.
+
     Args:
         returns: T x N simple returns (T >= 2).
         target: ``"constant_correlation"`` (default) or ``"identity"``.
@@ -417,9 +454,13 @@ def cov_ledoit_wolf(
         periods_per_year: periods per year used to annualize.
 
     Returns:
-        N x N symmetric covariance DataFrame labelled by asset; positive
+        N x N symmetric covariance DataFrame labelled by asset. It is positive
         definite whenever delta > 0 and the target is positive definite, even
-        when T <= N and the sample covariance is singular.
+        when T <= N and the sample covariance is singular. In finite samples,
+        however, the estimated intensity can be clipped to delta = 0 (see
+        :func:`ledoit_wolf_shrinkage`). The result is then the ddof = 0 sample
+        covariance, which is singular when T <= N. Check it with
+        :func:`is_positive_definite` before inverting it.
 
     Raises:
         ValueError: as :func:`ledoit_wolf_shrinkage`, or on non-positive
