@@ -60,9 +60,32 @@ def _load_returns(args: argparse.Namespace) -> tuple[pd.DataFrame, data.Syntheti
         if not args.csv:
             raise SystemExit("--csv PATH is required with --source csv")
         prices = data.load_prices_csv(args.csv)
+        # Both ends inclusive, like label slicing on the date index.
+        prices = prices.sort_index().loc[args.start : args.end]
+        if prices.empty:
+            raise ValueError(f"no prices in {args.csv} between {args.start} and {args.end}")
     else:
-        prices = data.load_prices_yahoo(args.tickers, start=args.start, end=args.end)
+        start = args.start if args.start is not None else data.DEFAULT_START
+        prices = data.load_prices_yahoo(args.tickers, start=start, end=args.end)
     return data.prices_to_returns(prices), None
+
+
+def _output_dir(args: argparse.Namespace, command: str) -> Path:
+    """Create the output directory up front, so a bad --out fails before the work."""
+    out = Path(args.out) / command
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _max_sharpe_or_none(
+    mu: pd.Series, cov: pd.DataFrame, rf: float, label: str
+) -> pd.Series | None:
+    """Tangency portfolio, or None (with a note) when no portfolio beats rf."""
+    try:
+        return markowitz.max_sharpe(mu, cov, rf=rf)
+    except ValueError as exc:
+        print(f"{label}: skipped ({exc})")
+        return None
 
 
 def _describe(returns: pd.DataFrame, args: argparse.Namespace) -> None:
@@ -108,7 +131,7 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     """Efficient frontier with sample and Ledoit-Wolf inputs, plus every portfolio type."""
     returns, _ = _load_returns(args)
     _describe(returns, args)
-    out = Path(args.out) / "frontier"
+    out = _output_dir(args, "frontier")
     mu = estimators.mean_historical(returns)
     cov = estimators.cov_sample(returns)
     cov_lw = estimators.cov_ledoit_wolf(returns)
@@ -118,25 +141,27 @@ def cmd_frontier(args: argparse.Namespace) -> int:
     frontier = markowitz.efficient_frontier(mu, cov, n_points=args.points, rf=args.rf)
     frontier_lw = markowitz.efficient_frontier(mu, cov_lw, n_points=args.points, rf=args.rf)
     equal = pd.Series(1.0 / len(mu), index=mu.index)
-    portfolios = {
+    candidates = {
         "Equal weight": equal,
         "Min variance": markowitz.min_variance(cov),
-        "Max Sharpe": markowitz.max_sharpe(mu, cov, rf=args.rf),
-        "Max Sharpe (Ledoit-Wolf)": markowitz.max_sharpe(mu, cov_lw, rf=args.rf),
+        "Max Sharpe": _max_sharpe_or_none(mu, cov, args.rf, "Max Sharpe"),
+        "Max Sharpe (Ledoit-Wolf)": _max_sharpe_or_none(
+            mu, cov_lw, args.rf, "Max Sharpe (Ledoit-Wolf)"
+        ),
         "Black-Litterman (momentum views)": strategies.black_litterman_strategy(rf=args.rf)(
             returns
         ),
         "Risk parity (ERC)": risk_parity.equal_risk_contribution(cov),
         "HRP": hrp.hrp_weights(cov),
     }
+    portfolios = {name: w for name, w in candidates.items() if w is not None}
     stats = _portfolio_stats(portfolios, mu, cov, args.rf)
     print("In-sample portfolio statistics (full-sample estimates; optimistic by construction):")
     print(_format_table(stats))
     print("\nWeights:")
     weights = pd.DataFrame(portfolios)
-    print(weights.map(lambda v: f"{v:.1%}").to_string())
+    print(weights.apply(lambda col: col.map(lambda v: f"{v:.1%}")).to_string())
 
-    out.mkdir(parents=True, exist_ok=True)
     weights.to_csv(out / "weights.csv")
     stats.to_csv(out / "stats.csv")
     frontier.to_csv(out / "frontier_sample.csv", index=False)
@@ -166,7 +191,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     """Walk-forward comparison of all strategies, net of transaction costs."""
     returns, _ = _load_returns(args)
     _describe(returns, args)
-    out = Path(args.out) / "backtest"
+    out = _output_dir(args, "backtest")
     momentum = min(252, args.lookback)
     strategy_set = strategies.default_strategies(rf=args.rf, momentum_lookback=momentum)
     print(
@@ -189,7 +214,6 @@ def cmd_backtest(args: argparse.Namespace) -> int:
                 "(no asset had a positive expected excess return)."
             )
 
-    out.mkdir(parents=True, exist_ok=True)
     table.to_csv(out / "summary.csv")
     pd.DataFrame({n: r.returns for n, r in results.items()}).to_csv(out / "daily_returns.csv")
     plots.save_figure(plots.plot_cumulative_returns(results), out / "cumulative_returns.png")
@@ -208,29 +232,44 @@ def cmd_experiment(args: argparse.Namespace) -> int:
     """Monte Carlo estimation-error study with known true parameters."""
     returns, market = _load_returns(args)
     _describe(returns, args)
-    out = Path(args.out) / "experiment"
+    out = _output_dir(args, "experiment")
     if market is not None:
         true_mu, true_cov = market.true_mu, market.true_cov
         print("Truth: the synthetic market's exact parameters.")
     else:
         true_mu, true_cov = experiments.calibrate_truth(returns)
         print("Truth: full-sample estimates from the data, treated as known parameters.")
-    sizes = tuple(args.sample_sizes)
-    print(f"Simulating {args.trials} histories for each of {sizes} days...\n")
+    sizes = tuple(sorted(set(args.sample_sizes)))
+    draws = "Gaussian" if args.tail_df is None else f"Student-t (df={args.tail_df:g})"
+    print(f"Simulating {args.trials} {draws} histories for each of {sizes} days...\n")
     summary = experiments.estimation_error_experiment(
-        true_mu, true_cov, sample_sizes=sizes, n_trials=args.trials, rf=args.rf, seed=args.seed
+        true_mu,
+        true_cov,
+        sample_sizes=sizes,
+        n_trials=args.trials,
+        rf=args.rf,
+        seed=args.seed,
+        tail_df=args.tail_df,
     )
-    columns = ["believed_sharpe", "true_sharpe", "optimism_gap", "pct_of_optimum", "fallback_rate"]
-    view = summary.set_index(["n_obs", "portfolio", "estimator"])[columns]
-    with pd.option_context("display.float_format", "{:.2f}".format, "display.width", 120):
-        print(view.to_string())
+    view = summary.set_index(["n_obs", "portfolio", "estimator"])[
+        ["believed_sharpe", "true_sharpe", "optimism_gap", "pct_of_optimum", "fallback_rate"]
+    ].copy()
+    for col in ("believed_sharpe", "true_sharpe", "optimism_gap"):
+        view[col] = view[col].map(lambda v: f"{v:.2f}")
+    for col in ("pct_of_optimum", "fallback_rate"):
+        view[col] = view[col].map(lambda v: f"{v:.0%}")
+    print(view.rename(columns={"pct_of_optimum": "% of optimum"}).to_string())
+    print(
+        "(Max Sharpe rows use min variance in the fallback_rate share of trials, where no "
+        "estimated mean beat rf.)"
+    )
 
     print(
         f"\nCovariance shrinkage: unconstrained minimum variance, {len(true_mu)} assets "
         "(extra true volatility over the true minimum):\n"
     )
     shrink = experiments.shrinkage_experiment(
-        true_cov, sample_sizes=sizes, n_trials=args.trials, seed=args.seed
+        true_cov, sample_sizes=sizes, n_trials=args.trials, seed=args.seed, tail_df=args.tail_df
     )
     table = shrink.pivot(index="n_obs", columns="estimator", values="excess_volatility")
     table["shrinkage δ"] = shrink.groupby("n_obs")["shrinkage"].max()
@@ -241,7 +280,6 @@ def cmd_experiment(args: argparse.Namespace) -> int:
             "(Shrinkage matters far more with many assets: try --source synthetic --n-assets 100.)"
         )
 
-    out.mkdir(parents=True, exist_ok=True)
     summary.to_csv(out / "estimation_error.csv", index=False)
     shrink.to_csv(out / "shrinkage.csv", index=False)
     plots.save_figure(plots.plot_estimation_error(summary), out / "estimation_error.png")
@@ -254,6 +292,7 @@ def cmd_experiment(args: argparse.Namespace) -> int:
             seed=args.seed,
             rf=args.rf,
             cov_estimator=estimator,
+            tail_df=args.tail_df,
         )
         plots.save_figure(
             plots.plot_frontier_experiment(
@@ -281,8 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(data.DEFAULT_UNIVERSE),
         help="tickers for --source yahoo (default: 12 multi-asset ETFs)",
     )
-    src.add_argument("--start", default=data.DEFAULT_START)
-    src.add_argument("--end", default=None)
+    src.add_argument(
+        "--start",
+        default=None,
+        help=f"first date for yahoo/csv data (yahoo default {data.DEFAULT_START}; csv: whole file)",
+    )
+    src.add_argument("--end", default=None, help="last date for yahoo/csv data (inclusive)")
     src.add_argument("--csv", default=None, help="wide price CSV for --source csv")
     src.add_argument("--n-assets", type=int, default=12, help="synthetic market size")
     src.add_argument("--years", type=float, default=16.0, help="synthetic history length")
@@ -305,6 +348,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trials", type=int, default=200)
     p.add_argument("--sample-sizes", type=int, nargs="+", default=[63, 126, 252, 504, 1260])
     p.add_argument("--frontier-days", type=int, default=252)
+    p.add_argument(
+        "--tail-df",
+        type=float,
+        default=None,
+        help="simulate fat-tailed Student-t returns with these degrees of freedom (> 2); "
+        "default: Gaussian",
+    )
     p.set_defaults(func=cmd_experiment)
     return parser
 
@@ -314,7 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (ImportError, RuntimeError, ValueError) as exc:
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

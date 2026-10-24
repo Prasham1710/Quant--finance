@@ -85,11 +85,15 @@ def plot_efficient_frontier(
                 label=name,
             )
     if rf is not None:
-        best = frontier.loc[frontier["sharpe"].idxmax()]
-        x_max = float(frontier["volatility"].max()) * 1.05
+        # Slope from this rf (the frontier's own Sharpe column may use another rf).
+        f_vol = frontier["volatility"].to_numpy(dtype=float)
+        f_ret = frontier["return"].to_numpy(dtype=float)
+        positive = f_vol > 0
+        slope = float(np.max((f_ret[positive] - rf) / f_vol[positive]))
+        x_max = float(f_vol.max()) * 1.05
         ax.plot(
             [0.0, x_max],
-            [rf, rf + best["sharpe"] * x_max],
+            [rf, rf + slope * x_max],
             lw=1,
             color="0.3",
             ls=":",
@@ -137,6 +141,11 @@ def plot_weights_over_time(result: BacktestResult, title: str | None = None) -> 
     """Stacked area of a backtest's target weights at each rebalance date."""
     fig, ax = _new_figure(10.0, 5.0)
     w = result.weights.fillna(0.0)
+    end = result.returns.index[-1]
+    if len(w) and end > w.index[-1]:
+        # Hold the last target weights to the end of the backtest so the final
+        # rebalance gets a visible band (step="post" draws each row until the next).
+        w = pd.concat([w, w.iloc[[-1]].set_axis([end])])
     ax.stackplot(w.index, w.T.to_numpy(), labels=[str(c) for c in w.columns], step="post")
     ax.set_ylim(0.0, 1.0)
     ax.yaxis.set_major_formatter(_PCT)
@@ -222,6 +231,7 @@ def plot_estimation_error(summary: pd.DataFrame, title: str | None = None) -> Fi
     fig = Figure(figsize=(11.0, 5.0), layout="constrained")
     # Separate y scales: the believed Sharpe ratios are several times the true ones.
     ax_believed, ax_true = fig.subplots(1, 2)
+    summary = summary.sort_values("n_obs", kind="stable")
     optimized = summary[summary["estimator"] != "-"]
     for (portfolio, estimator), group in optimized.groupby(["portfolio", "estimator"], sort=False):
         label = f"{portfolio} ({estimator})"
@@ -248,6 +258,7 @@ def plot_shrinkage(summary: pd.DataFrame, title: str | None = None) -> Figure:
     Args:
         summary: output of :func:`experiments.shrinkage_experiment`.
     """
+    summary = summary.sort_values("n_obs", kind="stable")
     fig = Figure(figsize=(11.0, 4.5), layout="constrained")
     ax_risk, ax_delta = fig.subplots(1, 2)
     labels = {"sample": "Sample covariance", "ledoit_wolf": "Ledoit-Wolf"}

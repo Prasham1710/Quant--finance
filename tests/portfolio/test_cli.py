@@ -95,3 +95,41 @@ def test_download_errors_become_exit_code_1(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(data, "load_prices_yahoo", failing)
     assert cli.main(["frontier", "--out", str(tmp_path)]) == 1
     assert "no data returned" in capsys.readouterr().err
+
+
+def test_backtest_sharpe_uses_the_risk_free_rate(tmp_path):
+    from quantfin.portfolio import metrics
+
+    args = ["backtest", *SMALL, "--lookback", "252", "--rf", "0.02", "--out", str(tmp_path)]
+    assert cli.main(args) == 0
+    summary = pd.read_csv(tmp_path / "backtest" / "summary.csv", index_col=0)
+    daily = pd.read_csv(tmp_path / "backtest" / "daily_returns.csv", index_col=0)
+    expected = metrics.sharpe_ratio(daily["Equal weight"], rf=0.02)
+    assert summary.loc["Equal weight", "Sharpe"] == pytest.approx(expected)
+
+
+def test_csv_source_respects_start_and_end(tmp_path, capsys):
+    market = data.synthetic_market(n_assets=3, n_years=3, seed=9)
+    path = tmp_path / "prices.csv"
+    market.prices.to_csv(path)
+    argv = ["frontier", "--source", "csv", "--csv", str(path), "--start", "2006-01-01"]
+    assert cli.main([*argv, "--end", "2006-12-29", "--out", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "(2006-01-03 to 2006-12-29)" in out
+
+
+def test_missing_csv_and_bad_output_path_exit_with_code_1(tmp_path, capsys):
+    argv = ["frontier", "--source", "csv", "--csv", str(tmp_path / "nope.csv")]
+    assert cli.main([*argv, "--out", str(tmp_path)]) == 1
+    assert "not found" in capsys.readouterr().err
+    blocker = tmp_path / "a_file"
+    blocker.write_text("")
+    assert cli.main(["frontier", *SMALL, "--out", str(blocker)]) == 1
+
+
+def test_frontier_survives_when_no_asset_beats_rf(tmp_path, capsys):
+    assert cli.main(["frontier", *SMALL, "--rf", "0.5", "--out", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Max Sharpe: skipped" in out
+    weights = pd.read_csv(tmp_path / "frontier" / "weights.csv", index_col=0)
+    assert "Max Sharpe" not in weights.columns and "Min variance" in weights.columns

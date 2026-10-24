@@ -109,6 +109,11 @@ def run_estimation_error_trials(
     sizes = [int(n) for n in sample_sizes]
     if not sizes or min(sizes) < 2:
         raise ValueError("sample_sizes must be non-empty and each at least 2")
+    if bounds is None and min(sizes) <= len(mu_true):
+        raise ValueError(
+            f"with unconstrained weights every sample size must exceed the number of assets "
+            f"({len(mu_true)}): the sample covariance is singular otherwise"
+        )
     rng = np.random.default_rng(seed)
 
     w_opt = _max_sharpe_or_none(mu_true, cov_true, rf, bounds)

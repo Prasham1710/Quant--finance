@@ -152,3 +152,35 @@ def test_default_strategy_names():
         "Risk parity (ERC)",
         "HRP",
     ]
+
+
+def test_black_litterman_handles_rf_as_excess_returns(window):
+    # The posterior is in excess returns; the strategy adds rf back and lets max
+    # Sharpe subtract it again, so the result equals max Sharpe on the excess mean.
+    rf = 0.01
+    # Low confidence keeps the posterior near the (positive) equilibrium prior.
+    strategy = strategies.black_litterman_strategy(rf=rf, view_confidence=0.05)
+    post = strategy.posterior(window)
+    assert post.mu.max() > 0  # a tangency portfolio exists
+    w = strategy(window)
+    assert strategy.fallbacks == 0
+    pd.testing.assert_series_equal(w, markowitz.max_sharpe(post.mu + rf, post.cov, rf=rf))
+    np.testing.assert_allclose(w, markowitz.max_sharpe(post.mu, post.cov, rf=0.0), atol=1e-7)
+
+
+def test_max_sharpe_falls_back_when_every_mean_is_positive_but_below_rf(window):
+    mu = estimators.mean_historical(window)
+    shifted = window + (0.01 - float(mu.min())) / 252  # every annual mean now >= 1%
+    mu_shifted = estimators.mean_historical(shifted)
+    assert (mu_shifted > 0).all()
+    strategy = strategies.max_sharpe_strategy(rf=float(mu_shifted.max()) + 0.01)
+    w = strategy(shifted)
+    assert strategy.fallbacks == 1
+    assert strategy.fallback_reasons[0][1] == "no asset has expected return above rf"
+    pd.testing.assert_series_equal(w, markowitz.min_variance(estimators.cov_sample(shifted)))
+
+
+def test_black_litterman_requires_a_full_momentum_window(window):
+    strategy = strategies.black_litterman_strategy(momentum_lookback=252)
+    with pytest.raises(ValueError, match="too short"):
+        strategy(window.iloc[:200])

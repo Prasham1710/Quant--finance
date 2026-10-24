@@ -163,8 +163,12 @@ class BlackLittermanMomentum(_FallbackLog):
        view (0 = ignore views and hold the prior, 1 = trust them fully).
     4. Portfolio: max Sharpe on the posterior mean (plus ``rf``) and posterior covariance.
 
-    Low confidence pulls weights toward ``w_mkt``; that shrinkage toward a sensible
-    prior is what makes Black-Litterman portfolios far less extreme than plain max Sharpe.
+    Low confidence pulls the posterior toward the prior and the weights toward
+    ``w_mkt``. Idzorek's confidence is defined for each view in isolation, though:
+    with one absolute view per asset on correlated assets the views interact, so the
+    posterior can move more (or less) than ``view_confidence`` toward a given view,
+    and max Sharpe on it can still be concentrated. Lower the confidence for weights
+    closer to the prior.
     """
 
     cov_estimator: str = "ledoit_wolf"
@@ -193,14 +197,20 @@ class BlackLittermanMomentum(_FallbackLog):
         return w / w.sum()
 
     def momentum_views(self, window: pd.DataFrame) -> pd.Series:
-        """Annualized trailing excess return of each asset, skipping the latest days."""
-        end = len(window) - self.momentum_skip
-        start = max(0, len(window) - self.momentum_lookback)
-        if end - start < 2:
+        """Annualized trailing excess return of each asset, skipping the latest days.
+
+        Raises:
+            ValueError: if the window is shorter than ``momentum_lookback`` (the views
+                would silently use a shorter horizon than configured).
+        """
+        if len(window) < self.momentum_lookback:
             raise ValueError(
                 f"window of {len(window)} rows is too short for momentum views "
-                f"(lookback {self.momentum_lookback}, skip {self.momentum_skip})"
+                f"(lookback {self.momentum_lookback}, skip {self.momentum_skip}); use a "
+                "longer backtest lookback or a shorter momentum_lookback"
             )
+        end = len(window) - self.momentum_skip
+        start = len(window) - self.momentum_lookback
         momentum = estimators.mean_historical(window.iloc[start:end])
         return momentum - self.rf
 

@@ -74,3 +74,43 @@ def test_experiment_plots(market, tmp_path):
 def test_shrinkage_plot(market, tmp_path):
     table = experiments.shrinkage_experiment(market.true_cov, sample_sizes=(3, 63), n_trials=3)
     _assert_drawn(plots.plot_shrinkage(table), tmp_path, "shrinkage")
+
+
+def test_frontier_plot_draws_the_right_data(market):
+    mu = estimators.mean_historical(market.returns)
+    cov = estimators.cov_sample(market.returns)
+    frontier = markowitz.efficient_frontier(mu, cov, n_points=15, rf=0.0)
+    fig = plots.plot_efficient_frontier(frontier, rf=0.01)
+    line, cml = fig.axes[0].get_lines()[:2]
+    np.testing.assert_allclose(line.get_xdata(), frontier["volatility"])
+    np.testing.assert_allclose(line.get_ydata(), frontier["return"])
+    # The capital market line starts at rf and touches (never crosses) the frontier.
+    x, y = cml.get_xdata(), cml.get_ydata()
+    slope = (y[1] - y[0]) / (x[1] - x[0])
+    assert y[0] == pytest.approx(0.01)
+    cml_at_frontier = 0.01 + slope * frontier["volatility"]
+    assert (frontier["return"] <= cml_at_frontier + 1e-12).all()
+    assert (cml_at_frontier - frontier["return"]).min() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_estimation_error_plot_puts_believed_and_true_in_their_panels(market):
+    summary = experiments.estimation_error_experiment(
+        market.true_mu, market.true_cov, sample_sizes=(126, 63), n_trials=3, seed=0
+    )
+    fig = plots.plot_estimation_error(summary)
+    believed_ax, true_ax = fig.axes[:2]
+    rows = summary[(summary["portfolio"] == "Max Sharpe") & (summary["estimator"] == "sample")]
+    rows = rows.sort_values("n_obs")
+    first_believed = believed_ax.get_lines()[0]
+    first_true = true_ax.get_lines()[0]
+    np.testing.assert_allclose(first_believed.get_xdata(), rows["n_obs"])
+    np.testing.assert_allclose(first_believed.get_ydata(), rows["believed_sharpe"])
+    np.testing.assert_allclose(first_true.get_ydata(), rows["true_sharpe"])
+
+
+def test_weights_over_time_covers_the_final_rebalance(results):
+    fig = plots.plot_weights_over_time(results["HRP"])
+    collection = fig.axes[0].collections[0]
+    x_max = collection.get_paths()[0].vertices[:, 0].max()
+    end = results["HRP"].returns.index[-1]
+    assert x_max >= fig.axes[0].convert_xunits(end)

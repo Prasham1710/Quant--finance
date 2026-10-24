@@ -214,3 +214,67 @@ def test_shrinkage_experiment_validation(truth):
         experiments.shrinkage_experiment(cov, n_trials=0)
     with pytest.raises(ValueError):
         experiments.shrinkage_experiment(cov, sample_sizes=(1,))
+
+
+def test_trials_match_an_independent_replay(truth):
+    from quantfin.portfolio import data
+
+    mu, cov = truth
+    trials = experiments.run_estimation_error_trials(
+        mu, cov, sample_sizes=(126,), n_trials=2, seed=7
+    )
+    rng = np.random.default_rng(7)
+    for trial in range(2):
+        sim = data.simulate_returns(mu, cov, 126, rng)
+        mu_hat = sim.mean() * 252
+        for name, cov_hat in (
+            ("sample", sim.cov() * 252),
+            ("ledoit_wolf", estimators.cov_ledoit_wolf(sim)),
+        ):
+            rows = trials[(trials["trial"] == trial) & (trials["estimator"] == name)]
+            rows = rows.set_index("portfolio")
+            w_mv = markowitz.min_variance(cov_hat)
+            # Max Sharpe is undefined (and min variance is used) when no mean beats rf=0.
+            fallback = not (mu_hat > 0).any()
+            w_ms = w_mv if fallback else markowitz.max_sharpe(mu_hat, cov_hat)
+            assert bool(rows.loc["Max Sharpe", "fallback"]) == fallback
+            for portfolio, w in (("Max Sharpe", w_ms), ("Min variance", w_mv)):
+                row = rows.loc[portfolio]
+                believed = markowitz.portfolio_sharpe(w, mu_hat, cov_hat)
+                assert row["believed_sharpe"] == pytest.approx(believed, rel=1e-6)
+                assert row["true_sharpe"] == pytest.approx(
+                    markowitz.portfolio_sharpe(w, mu, cov), rel=1e-6
+                )
+                assert row["true_volatility"] == pytest.approx(
+                    markowitz.portfolio_volatility(w, cov), rel=1e-6
+                )
+
+
+def test_ledoit_wolf_rows_use_the_shrunk_covariance(trials):
+    ms = trials[trials["portfolio"] == "Min variance"]
+    sample = ms[ms["estimator"] == "sample"]["true_volatility"].to_numpy()
+    shrunk = ms[ms["estimator"] == "ledoit_wolf"]["true_volatility"].to_numpy()
+    assert not np.allclose(sample, shrunk)
+
+
+def test_summary_statistics_match_the_trials(trials):
+    summary = experiments.summarize_estimation_error(trials)
+    for (n_obs, portfolio, est), group in trials.groupby(["n_obs", "portfolio", "estimator"]):
+        row = summary[
+            (summary["n_obs"] == n_obs)
+            & (summary["portfolio"] == portfolio)
+            & (summary["estimator"] == est)
+        ].iloc[0]
+        values = group["true_sharpe"].to_numpy()
+        assert row["true_sharpe"] == pytest.approx(values.mean())
+        assert row["true_sharpe_p05"] == pytest.approx(np.quantile(values, 0.05))
+        assert row["true_sharpe_p95"] == pytest.approx(np.quantile(values, 0.95))
+        assert row["true_sharpe_p05"] <= row["true_sharpe"] <= row["true_sharpe_p95"]
+        assert row["fallback_rate"] == pytest.approx(group["fallback"].mean())
+    assert not trials.loc[trials["portfolio"] != "Max Sharpe", "fallback"].any()
+
+
+def test_unconstrained_experiment_needs_more_observations_than_assets(truth):
+    mu, cov = truth
+    with pytest.raises(ValueError, match="exceed the number of assets"):
+        experiments.run_estimation_error_trials(mu, cov, sample_sizes=(5,), bounds=None)
