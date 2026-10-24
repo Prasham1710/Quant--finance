@@ -982,16 +982,14 @@ def test_efficient_risk_at_minimum_volatility_picks_efficient_end_of_mvp_set():
     vol_mvp = portfolio_volatility(min_variance(DUP_COV), DUP_COV)
     w = efficient_risk(DUP_MU, DUP_COV, vol_mvp).to_numpy()
     # Minimum variance splits 9/13 into the duplicated risk and 4/13 into asset 3;
-    # the efficient version puts the whole 9/13 into the 10% class. The flat end is
-    # located to a 1e-9 relative variance tolerance, i.e. O(sqrt(1e-9)) in weights.
-    np.testing.assert_allclose(w, [0.0, 9 / 13, 4 / 13], atol=1e-4)
-    assert portfolio_return(w, DUP_MU) == pytest.approx((0.10 * 9 + 0.07 * 4) / 13, abs=1e-5)
-    assert portfolio_volatility(w, DUP_COV) == pytest.approx(vol_mvp, rel=1e-8)
+    # the efficient version puts the whole 9/13 into the 10% class.
+    np.testing.assert_allclose(w, [0.0, 9 / 13, 4 / 13], atol=1e-9)
+    assert portfolio_volatility(w, DUP_COV) <= vol_mvp * (1 + 1e-9)
 
 
 def test_frontier_with_duplicated_asset_starts_at_efficient_end():
     frontier = efficient_frontier(DUP_MU, DUP_COV, 4)
-    assert frontier["return"].iloc[0] == pytest.approx((0.10 * 9 + 0.07 * 4) / 13, abs=1e-5)
+    assert frontier["return"].iloc[0] == pytest.approx((0.10 * 9 + 0.07 * 4) / 13, abs=1e-10)
     assert np.all(np.diff(frontier["volatility"]) > 0)
     weights = frontier[[0, 1, 2]].to_numpy()
     vols = np.sqrt(np.einsum("ij,jk,ik->i", weights, DUP_COV, weights))
@@ -1026,6 +1024,98 @@ def test_max_sharpe_with_rf_a_rounding_distance_below_the_best_return(gap):
     assert portfolio_return(w, mu) == pytest.approx(top, abs=1e-9)
     assert portfolio_return(w, mu) - (top - gap) > 0
     np.testing.assert_allclose(w, efficient_return(mu, cov, top, bounds), atol=1e-8)
+
+
+def _best_zero_risk_return(mu, cov, bounds):
+    """Independent LP: highest return among the minimum-variance portfolios.
+
+    Every minimizer of w'Σw shares Σw, so the minimum-variance set is
+    {w feasible : U'w = U'w_mvp} with U spanning range(Σ).
+    """
+    lam, vecs = np.linalg.eigh(cov)
+    u = vecs[:, lam > 1e-9 * lam[-1]]
+    w0 = min_variance(cov, bounds).to_numpy()
+    res = optimize.linprog(
+        -mu,
+        A_eq=np.vstack([u.T, np.ones(len(mu))]),
+        b_eq=np.r_[u.T @ w0, 1.0],
+        bounds=[bounds] * len(mu),
+        method="highs",
+    )
+    assert res.status == 0
+    return -res.fun
+
+
+def _rank_deficient_case(seed, n, t):
+    rng = np.random.default_rng(seed)
+    mu = rng.uniform(0.02, 0.12, n)
+    cov = np.cov(rng.normal(size=(t, n)) * 0.01, rowvar=False) * TRADING_DAYS
+    return mu, cov
+
+
+@pytest.mark.parametrize(
+    "seed, n, t, bounds",
+    [
+        (39, 30, 15, (-0.2, 0.6)),
+        (11, 5, 2, (-0.2, 0.6)),
+        (18, 11, 5, (-0.2, 0.6)),
+        (20, 11, 4, (0.0, 0.4)),
+        (8, 9, 4, (0.0, 0.4)),
+        (3, 8, 5, (0.0, 1.0)),
+    ],
+)
+def test_singular_frontier_starts_at_best_minimum_variance_portfolio(seed, n, t, bounds):
+    mu, cov = _rank_deficient_case(seed, n, t)
+    best = _best_zero_risk_return(mu, cov, bounds)
+    frontier = efficient_frontier(mu, cov, 5, bounds=bounds)
+    assert frontier["return"].iloc[0] >= best - 1e-9
+    # A risk budget equal to the minimum volatility must reach the same return.
+    noise = 1e-6 * math.sqrt(np.trace(cov) / n)
+    target = portfolio_volatility(min_variance(cov, bounds), cov)
+    w = efficient_risk(mu, cov, target, bounds)
+    assert portfolio_return(w, mu) >= best - 1e-9
+    assert portfolio_volatility(w, cov) <= target * (1 + 1e-9) + noise
+
+
+def test_return_range_on_a_singular_covariance_accepts_the_flat_face():
+    r_end = (0.10 * 9 + 0.07 * 4) / 13
+    exact = efficient_frontier(DUP_MU, DUP_COV, 3, return_range=(r_end, 0.095))
+    assert exact["return"].iloc[0] == pytest.approx(r_end, abs=1e-12)
+    # The solver's own minimum-variance return lies on the dominated flat face:
+    # the frontier starts at the face's efficient end instead of raising.
+    r_solver = portfolio_return(min_variance(DUP_COV), DUP_MU)
+    clamped = efficient_frontier(DUP_MU, DUP_COV, 3, return_range=(r_solver, 0.095))
+    assert clamped["return"].iloc[0] == pytest.approx(r_end, abs=1e-12)
+    # Below the face's lowest return (all 9/13 in the 5% class) is the inefficient branch.
+    with pytest.raises(ValueError, match="inefficient branch"):
+        efficient_frontier(DUP_MU, DUP_COV, 3, return_range=(0.05, 0.095))
+
+
+def test_unbounded_return_on_the_minimum_variance_face_is_an_arbitrage_error():
+    bounds = [(None, None), (None, None), (0.0, 1.0)]
+    with pytest.raises(ValueError, match="riskless arbitrage"):
+        efficient_frontier(DUP_MU, DUP_COV, 4, bounds=bounds)
+
+
+def test_max_sharpe_with_near_tied_top_returns_is_shift_invariant():
+    cov = np.diag([0.09, 0.01])
+    mu = np.array([0.08 + 1e-10, 0.08])
+    rf = float(mu.max()) - 5e-10
+    # Diagonal covariance: tangency w ∝ (μ - rf) / σ², both excesses positive.
+    excess = mu - rf
+    expected = (excess / np.diag(cov)) / (excess / np.diag(cov)).sum()
+    np.testing.assert_allclose(max_sharpe(mu, cov, rf), expected, atol=1e-6)
+    np.testing.assert_allclose(max_sharpe(mu - 0.08, cov, rf - 0.08), expected, atol=1e-6)
+
+
+def test_max_sharpe_near_the_top_still_reports_an_unbounded_sharpe_ratio():
+    # Asset 3 is riskless and has the highest return: the Sharpe ratio is unbounded
+    # for any rf below 8%, including one a rounding distance below it.
+    cov = np.diag([0.04, 0.09, 0.0])
+    mu = np.array([0.05, 0.07, 0.08])
+    for rf in (0.07, 0.08 - 1e-10):
+        with pytest.raises(ValueError, match="riskless"):
+            max_sharpe(mu, cov, rf)
 
 
 @pytest.mark.parametrize(

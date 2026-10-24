@@ -118,9 +118,9 @@ _FEAS_TOL = 1e-8
 # N * eps is rounding noise: the matrix is singular for practical purposes.
 _PD_FACTOR = 1e3
 
-# When rf is within this RELATIVE distance of the highest attainable return, the
-# tangency portfolio is taken as its limit, the minimum-variance portfolio at
-# that return (the convex reformulation is too ill-conditioned to solve there).
+# When the tangency QP fails and rf is within this distance of the highest
+# attainable return (relative to max |μ - rf|), the tangency portfolio is taken
+# as its limit, the minimum-variance portfolio at that return.
 _DEGENERATE_EXCESS = 1e-8
 
 _FRONTIER_COLUMNS = ("return", "volatility", "sharpe")
@@ -817,56 +817,81 @@ def _volatility(w: np.ndarray, cov: np.ndarray) -> float:
     return math.sqrt(max(float(w @ cov @ w), 0.0))
 
 
-def _efficient_mvp(
-    prob: _Problem, w_mvp: np.ndarray, attainable: _ReturnRange | None = None
-) -> tuple[float, np.ndarray]:
+def _min_variance_face_extreme(
+    prob: _Problem, w_mvp: np.ndarray, sense: float
+) -> np.ndarray | None:
+    """Highest (sense=+1) or lowest (sense=-1) return over the minimum-variance set.
+
+    Every minimizer of the convex quadratic w'Σw over the feasible set has the same
+    Σw, so the minimum-variance set is the face
+    ``{w feasible : U'w = U'w_mvp}``, where U spans the range of Σ (eigenvectors
+    with non-negligible eigenvalues). Its extreme returns are therefore an exact LP,
+    solved with HiGHS on centred, spread-scaled costs (so its optimality tolerance
+    is relative to the spread of μ) and tight feasibility tolerances.
+
+    Returns:
+        The extreme portfolio, or None if the LP could not be solved reliably or
+        (for sense=-1) is unbounded.
+
+    Raises:
+        ValueError: for sense=+1 when the return is unbounded on the minimum-variance
+            set: a riskless arbitrage under partly unbounded weights.
+    """
+    cov, mu, lo, hi = prob.cov, prob.mu, prob.lo, prob.hi
+    eigenvalues, vectors = np.linalg.eigh(cov)
+    keep = eigenvalues > _PD_FACTOR * prob.n * _EPS * max(float(eigenvalues[-1]), 0.0)
+    u = vectors[:, keep]
+    a_eq = np.vstack([u.T, np.ones(prob.n)])
+    b_eq = np.concatenate([u.T @ w_mvp, [1.0]])
+    cost = -sense * (mu - mu.mean()) / float(np.ptp(mu))
+    bounds = [
+        (None if np.isneginf(lo_i) else lo_i, None if np.isposinf(hi_i) else hi_i)
+        for lo_i, hi_i in zip(lo, hi, strict=True)
+    ]
+    res = optimize.linprog(
+        cost,
+        A_eq=a_eq,
+        b_eq=b_eq,
+        bounds=bounds,
+        method="highs",
+        options={"primal_feasibility_tolerance": 1e-10, "dual_feasibility_tolerance": 1e-10},
+    )
+    if res.status == 3:
+        if sense > 0:
+            raise ValueError(
+                "riskless arbitrage: the expected return is unbounded among the "
+                "minimum-variance portfolios under these bounds"
+            )
+        return None
+    if res.status != 0 or res.x is None:
+        return None
+    w = _repair_budget(np.clip(res.x, lo, hi), lo, hi)
+    var_mvp = float(w_mvp @ cov @ w_mvp)
+    if float(w @ cov @ w) > var_mvp * (1.0 + 1e-9) + _variance_noise(cov):
+        return None
+    return w
+
+
+def _efficient_mvp(prob: _Problem, w_mvp: np.ndarray) -> tuple[float, np.ndarray]:
     """The highest-return portfolio among the minimum-variance portfolios.
 
     A positive definite covariance has a unique minimum-variance portfolio, which is
     returned unchanged. A singular one (T < N sample covariance, or two assets with
-    identical risk) has a whole set of them, and the solver may return any member;
-    only the member with the highest return is efficient, the rest are dominated.
-    Beyond ``r_mvp`` the frontier variance is convex and non-decreasing in the target
-    return, so it stays at its minimum on ``[r_mvp, r_low]``: bisection finds
-    ``r_low``, the efficient end of that flat stretch.
+    identical risk) has a whole face of them, and the QP solver may return any
+    member; only the member with the highest return is efficient, the rest are
+    dominated (same risk, less return). That member solves an exact LP
+    (:func:`_min_variance_face_extreme`).
 
     Returns:
-        ``(r_low, w_low)``.
+        ``(r_low, w_low)``: the efficient end of the minimum-variance set.
     """
     r_mvp = float(prob.mu @ w_mvp)
     if not prob.bounded or _mu_is_constant(prob.mu) or not _is_singular(prob.cov):
         return r_mvp, w_mvp
-    cov = prob.cov
-    var_cap = float(w_mvp @ cov @ w_mvp) * (1.0 + 1e-9) + _variance_noise(cov)
-    rng = attainable if attainable is not None else _return_range(prob, prob.mu)
-
-    def on_flat(r: float) -> tuple[bool, np.ndarray]:
-        w = _efficient_return_core(prob, r, rng)
-        return float(w @ cov @ w) <= var_cap, w
-
-    r_hi = rng.top.value
-    if not math.isfinite(r_hi):
-        step = max(float(np.ptp(prob.mu)), 1e-12)
-        for _ in range(200):
-            r_hi = r_mvp + step
-            if not on_flat(r_hi)[0]:
-                break
-            step *= 2.0
-        else:
-            raise OptimizationError("could not bound the minimum-variance set")
-    flat, w_hi = on_flat(r_hi)
-    if flat:
-        return r_hi, w_hi
-    r_lo, w_lo = r_mvp, w_mvp
-    resolution = 1e-12 * max(r_hi - r_mvp, abs(r_hi), float(np.finfo(float).tiny))
-    while r_hi - r_lo > resolution:
-        mid = 0.5 * (r_lo + r_hi)
-        flat, w = on_flat(mid)
-        if flat:
-            r_lo, w_lo = mid, w
-        else:
-            r_hi = mid
-    return r_lo, w_lo
+    w = _min_variance_face_extreme(prob, w_mvp, +1.0)
+    if w is None or float(prob.mu @ w) <= r_mvp:
+        return r_mvp, w_mvp
+    return float(prob.mu @ w), w
 
 
 def _efficient_risk_core(prob: _Problem, target: float) -> np.ndarray:
@@ -882,16 +907,19 @@ def _efficient_risk_core(prob: _Problem, target: float) -> np.ndarray:
         shift = math.sqrt(max(target * target - tf.var_mvp, 0.0) / tf.q)
         return _normalized(tf.w_mvp + shift * tf.v, "efficient_risk")
 
-    w_mvp = _min_variance_core(prob)
-    vol_mvp = _volatility(w_mvp, cov)
+    w_solver = _min_variance_core(prob)
+    vol_mvp = _volatility(w_solver, cov)
     _check_risk_target(target, vol_mvp)
     attainable = _return_range(prob, mu)
+    vol_noise = math.sqrt(_variance_noise(cov))
+    budget = target * (1.0 + 1e-9) + vol_noise
     # With a singular covariance the solver's minimum-variance portfolio may be a
     # dominated member of the minimum-variance set; start from its efficient end.
-    r_mvp, w_mvp = _efficient_mvp(prob, w_mvp, attainable)
+    r_mvp, w_mvp = _efficient_mvp(prob, w_solver)
+    if _volatility(w_mvp, cov) > budget:
+        r_mvp, w_mvp = float(mu @ w_solver), w_solver
     if target <= vol_mvp * (1.0 + 1e-12):
         return w_mvp
-    vol_noise = math.sqrt(_variance_noise(cov))
     # The best evaluated frontier point within the risk budget (highest return
     # with σ <= target), so the answer never depends on which side of the
     # root the root finder happens to stop.
@@ -947,7 +975,7 @@ def _efficient_risk_core(prob: _Problem, target: float) -> np.ndarray:
             # The root finder stopped a rounding step above the root: take the
             # closest evaluated point below it, which respects the risk budget.
             w = best_w
-    if _volatility(w, cov) > target * (1.0 + 1e-9) + vol_noise:
+    if _volatility(w, cov) > budget:
         raise OptimizationError("efficient_risk: solution exceeds the target volatility")
     return w
 
@@ -1005,13 +1033,6 @@ def _max_sharpe_core(prob: _Problem, rf: float) -> np.ndarray:
             f"no feasible portfolio has expected return above rf={rf} (best attainable "
             f"{rng.top.value}); the maximum-Sharpe portfolio is undefined"
         )
-    if best_excess <= _DEGENERATE_EXCESS * max(float(np.abs(mu).max()), abs(rf)):
-        # rf is a rounding distance below the highest attainable return. The QP
-        # below then needs y ~ 1/excess and is too ill-conditioned to solve, but
-        # the answer is known: as rf rises to r_max only portfolios near r_max
-        # keep a positive excess, and among them the Sharpe ratio is maximized
-        # at r_max itself, by its minimum-variance portfolio.
-        return _efficient_return_core(prob, rng.top.value, rng)
 
     # Feasible start with a comfortably positive excess return. The QP start
     # is y0 = w0 / (ê'w0), so ê'w0 must not be tiny: a centre whose excess is
@@ -1053,25 +1074,36 @@ def _max_sharpe_core(prob: _Problem, rf: float) -> np.ndarray:
     if not (np.isfinite(lo).all() and np.isfinite(hi).all()):
         rows.append(ones)  # k >= 0 (implied when every bound is finite)
     G = np.array(rows).reshape(-1, n)
-    y = _solve_qp(
-        cov / scale,
-        np.zeros(n),
-        e_hat[None, :],
-        np.ones(1),
-        y_lo,
-        y_hi,
-        y0,
-        "max_sharpe",
-        G=G,
-        h=np.zeros(G.shape[0]),
-    )
-    k = float(y.sum())
-    if not k > 1e-12 * float(np.abs(y).sum()):
-        raise ValueError(
-            "maximum Sharpe ratio is only approached by an infinitely leveraged "
-            "zero-cost portfolio under these bounds"
+    try:
+        y = _solve_qp(
+            cov / scale,
+            np.zeros(n),
+            e_hat[None, :],
+            np.ones(1),
+            y_lo,
+            y_hi,
+            y0,
+            "max_sharpe",
+            G=G,
+            h=np.zeros(G.shape[0]),
         )
-    w = _finalize_weights(y / k, lo, hi, "max_sharpe")
+    except OptimizationError:
+        if best_excess > _DEGENERATE_EXCESS * float(np.abs(excess).max()):
+            raise
+        # rf is a rounding distance below the highest attainable return (relative
+        # to the spread of excess returns the QP sees), so y ~ 1/excess makes the
+        # QP too ill-conditioned to solve. Use the limit instead: as rf rises to
+        # r_max only portfolios at r_max keep a positive excess, and among them
+        # the Sharpe ratio is maximized by the minimum-variance one.
+        w = _efficient_return_core(prob, rng.top.value, rng)
+    else:
+        k = float(y.sum())
+        if not k > 1e-12 * float(np.abs(y).sum()):
+            raise ValueError(
+                "maximum Sharpe ratio is only approached by an infinitely leveraged "
+                "zero-cost portfolio under these bounds"
+            )
+        w = _finalize_weights(y / k, lo, hi, "max_sharpe")
     # A volatility below 1e-5 of the average asset volatility is numerically
     # zero: the covariance is singular (e.g. T < N) and admits a (near-)riskless
     # portfolio with positive excess return, i.e. an unbounded Sharpe ratio.
@@ -1299,7 +1331,9 @@ def efficient_risk(
     few ulps of the return; if the volatility there is a rounding step above
     ``σ*``, the closest evaluated frontier point inside the budget is taken),
     or, if ``σ*`` exceeds the volatility of the least risky maximum-return
-    portfolio, that portfolio (the risk budget is then not binding).
+    portfolio, that portfolio (the risk budget is then not binding). For a
+    singular covariance and ``σ*`` at the minimum volatility, the answer is the
+    highest-return portfolio among all minimum-variance portfolios.
 
     Args:
         mu: expected (annualized) returns.
@@ -1308,10 +1342,15 @@ def efficient_risk(
         bounds: weight bounds (default long-only), or None for unbounded.
 
     Returns:
-        Weights indexed by asset, summing to 1.
+        Weights indexed by asset, summing to 1. Their volatility is at most
+        ``σ* (1 + 1e-9) + 1e-6 σ̄`` (σ̄ = average asset volatility): bounded
+        solvers resolve variance only to about ``1e-12 σ̄²``, which matters only
+        when the minimum volatility is numerically zero (T < N covariances).
 
     Raises:
-        ValueError: invalid input, or a target below the minimum-variance volatility.
+        ValueError: invalid input, a target below the minimum-variance volatility,
+            or (with partly unbounded weights) a riskless arbitrage that makes the
+            return unbounded at minimum risk.
         OptimizationError: if the numerical solver fails.
     """
     target = _scalar(target_volatility, "target_volatility")
@@ -1410,7 +1449,8 @@ def efficient_frontier(
     attainable = _return_range(prob, mu_values) if prob.bounded else None
     # With a singular covariance, start at the efficient end of the minimum-variance
     # set; the portfolios before it have the same risk and less return (dominated).
-    r_mvp, w_mvp = _efficient_mvp(prob, _min_variance_core(prob), attainable)
+    w_solver = _min_variance_core(prob)
+    r_mvp, w_mvp = _efficient_mvp(prob, w_solver)
     tol = _return_tol(mu_values)
     if return_range is None:
         low = r_mvp
@@ -1433,10 +1473,18 @@ def efficient_frontier(
         if low > high:
             raise ValueError(f"return_range low {low} exceeds high {high}")
         if low < r_mvp - tol:
-            raise ValueError(
-                f"return_range starts at {low}, below the minimum-variance return {r_mvp}: "
-                "that part of the curve is the inefficient branch"
-            )
+            # Returns on the flat face of a singular covariance (same minimum risk,
+            # less return) are dominated by its efficient end: start there instead.
+            # Anything lower is on the inefficient branch.
+            r_face_min = float(mu_values @ w_solver)
+            if prob.bounded and r_mvp > r_face_min and _is_singular(cov_values):
+                w_low_end = _min_variance_face_extreme(prob, w_solver, -1.0)
+                r_face_min = -math.inf if w_low_end is None else float(mu_values @ w_low_end)
+            if low < r_face_min - tol:
+                raise ValueError(
+                    f"return_range starts at {low}, below the minimum-variance return "
+                    f"{r_face_min}: that part of the curve is the inefficient branch"
+                )
         low = max(low, r_mvp)
         high = max(high, low)
 
